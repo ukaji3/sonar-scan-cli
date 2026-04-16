@@ -176,7 +176,12 @@ ensure_local_install() {
     log "==> Extracting..."
     unzip -qo "$SONAR_HOME/sonarqube.zip" -d "$SONAR_HOME" || error_json "failed to extract SonarQube"
     rm -f "$SONAR_HOME/sonarqube.zip"
+    # Remove bundled JREs (~280MB) - system Java is used instead
+    rm -rf "$sq_dir/jres"
   fi
+  # Clean runtime data from previous runs
+  rm -rf "$sq_dir/data" "$sq_dir/temp" "$sq_dir/logs"
+  mkdir -p "$sq_dir/data" "$sq_dir/temp" "$sq_dir/logs"
 
   # sonar-scanner-cli (JRE-embedded, platform-specific)
   local platform scanner_dir scanner_zip_name
