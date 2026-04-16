@@ -262,11 +262,20 @@ SQ_PID=""
 
 cleanup_local() {
   log "==> Stopping local SonarQube..."
-  if [[ -n "$SQ_PID" ]] && kill -0 "$SQ_PID" 2>/dev/null; then
-    local sq_dir="$SONAR_HOME/sonarqube-${SQ_VERSION}"
-    local sq_bin
-    sq_bin="$(detect_sq_bin "$sq_dir")"
-    "$sq_bin" stop >/dev/null 2>&1 || kill "$SQ_PID" 2>/dev/null || true
+  local sq_dir="$SONAR_HOME/sonarqube-${SQ_VERSION}"
+  local sq_bin
+  sq_bin="$(detect_sq_bin "$sq_dir")"
+
+  # Graceful stop via sonar.sh
+  "$sq_bin" stop >/dev/null 2>&1 || true
+  sleep 2
+
+  # Kill any remaining SonarQube/ES processes from this instance
+  local pids
+  pids=$(pgrep -f "sonarqube-${SQ_VERSION}" 2>/dev/null || true)
+  if [[ -n "$pids" ]]; then
+    log "==> Force killing remaining processes..."
+    echo "$pids" | xargs kill -9 2>/dev/null || true
   fi
 }
 
