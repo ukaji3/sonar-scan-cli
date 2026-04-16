@@ -1,0 +1,17 @@
+# SonarQube scanner work directories
+.scannerwork/
+
+# Scan reports (generated output)
+sonar-report.json
+*.report.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
