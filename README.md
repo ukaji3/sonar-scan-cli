@@ -110,3 +110,11 @@ Local mode stores binaries in `~/.sonar-scan/` (shared across all projects).
 ## License
 
 [MIT](LICENSE)
+
+## Examples
+
+The `examples/` directory contains a sample Python project with intentional issues for testing:
+
+```bash
+./sonar-scan.sh ./examples
+```
