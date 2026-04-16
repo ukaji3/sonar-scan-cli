@@ -82,8 +82,10 @@ Stdout JSON schema (default -f json):
     {
       "status": "success",
       "project_key": "string",
-      "total_issues": 0,
       "run_mode": "docker|local",
+      "elapsed_seconds": 45,
+      "total_issues": 3,
+      "severity_counts": {"BLOCKER": 1, "CRITICAL": 1, "MAJOR": 1},
       "issues": [
         {
           "rule": "python:S1481",
@@ -95,7 +97,11 @@ Stdout JSON schema (default -f json):
       ]
     }
   Error:
-    {"status": "error", "error": "description of what went wrong"}
+    {
+      "status": "error",
+      "error_code": "timeout|missing_prerequisite|invalid_args|runtime_error|analysis_failed",
+      "error": "description of what went wrong"
+    }
 
 Performance:
   - First run (download): ~5-10 min (Docker pull or ZIP download)
@@ -124,10 +130,11 @@ EOF
 log() { [[ "$OUTPUT_MODE" != "json" ]] && echo "$*" >&2 || true; }
 
 error_json() {
+  local msg="$1" code="${2:-runtime_error}"
   if [[ "$OUTPUT_MODE" == "json" ]]; then
-    printf '{"status":"error","error":"%s"}\n' "$1"
+    printf '{"status":"error","error_code":"%s","error":"%s"}\n' "$code" "$msg"
   else
-    echo "ERROR: $1" >&2
+    echo "ERROR: $msg" >&2
   fi
   exit 1
 }
@@ -337,7 +344,7 @@ run_local() {
 wait_for_sonarqube() {
   local timeout=180 elapsed=0
   while ! curl -sf "http://localhost:$SONAR_PORT/api/system/status" 2>/dev/null | grep -q '"status":"UP"'; do
-    [[ "$elapsed" -ge "$timeout" ]] && error_json "SonarQube startup timed out (${timeout}s)"
+    [[ "$elapsed" -ge "$timeout" ]] && error_json "SonarQube startup timed out (${timeout}s)" "timeout"
     [[ "$OUTPUT_MODE" != "json" ]] && printf "." >&2 || true
     sleep 3
     elapsed=$((elapsed + 3))
@@ -362,10 +369,10 @@ wait_for_analysis() {
       "http://localhost:$SONAR_PORT/api/ce/component?component=$PROJECT_KEY" 2>/dev/null \
       | python3 -c "import json,sys; print(json.load(sys.stdin).get('current',{}).get('status',''))" 2>/dev/null || echo "")
     [[ "$status" == "SUCCESS" ]] && return 0
-    [[ "$status" == "FAILED" ]] && error_json "SonarQube analysis task failed"
+    [[ "$status" == "FAILED" ]] && error_json "SonarQube analysis task failed" "analysis_failed"
     sleep 2
   done
-  error_json "analysis task did not complete"
+  error_json "analysis task did not complete" "timeout"
 }
 
 fetch_and_output() {
@@ -375,6 +382,8 @@ fetch_and_output() {
   raw=$(curl -sf -u "$token:" \
     "http://localhost:$SONAR_PORT/api/issues/search?projectKeys=$PROJECT_KEY&ps=500") \
     || error_json "failed to fetch issues"
+
+  local elapsed_sec=$(( $(date +%s) - SCAN_START ))
 
   result=$(echo "$raw" | python3 -c "
 import json, sys
@@ -389,11 +398,17 @@ issues = [
     }
     for i in raw.get('issues', [])
 ]
+severity_counts = {}
+for i in issues:
+    s = i['severity']
+    severity_counts[s] = severity_counts.get(s, 0) + 1
 print(json.dumps({
     'status': 'success',
     'project_key': '$PROJECT_KEY',
     'run_mode': '$RUN_MODE',
+    'elapsed_seconds': $elapsed_sec,
     'total_issues': raw.get('total', 0),
+    'severity_counts': severity_counts,
     'issues': issues
 }, ensure_ascii=False))
 ")
@@ -406,8 +421,11 @@ print(json.dumps({
       echo "$result" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
-print(f\"Project: {d['project_key']} (mode: {d['run_mode']})\")
+print(f\"Project: {d['project_key']} (mode: {d['run_mode']}, {d['elapsed_seconds']}s)\")
 print(f\"Total issues: {d['total_issues']}\")
+sc = d.get('severity_counts', {})
+if sc:
+    print('Severity: ' + ', '.join(f'{k}={v}' for k,v in sorted(sc.items())))
 print('---')
 for i in d['issues']:
     print(f\"[{i['severity']}] {i['component']}:{i['line']} - {i['message']} ({i['rule']})\")
@@ -452,8 +470,8 @@ while getopts "m:k:o:p:f:t:e:s:vh" opt; do
 done
 shift $((OPTIND - 1))
 
-[[ $# -lt 1 ]] && error_json "source directory required. Run with -h for help."
-SOURCE_DIR="$(cd "$1" && pwd)" || error_json "directory not found: $1"
+[[ $# -lt 1 ]] && error_json "source directory required. Run with -h for help." "invalid_args"
+SOURCE_DIR="$(cd "$1" && pwd)" || error_json "directory not found: $1" "invalid_args"
 PROJECT_KEY="${PROJECT_KEY:-$(basename "$SOURCE_DIR")}"
 
 # Auto-detect run mode
@@ -463,11 +481,12 @@ if [[ -z "$RUN_MODE" || "$RUN_MODE" == "auto" ]]; then
   elif java -version >/dev/null 2>&1; then
     RUN_MODE="local"
   else
-    error_json "neither Docker nor Java found. Install Docker or Java 17+."
+    error_json "neither Docker nor Java found. Install Docker or Java 17+." "missing_prerequisite"
   fi
 fi
 
 log "==> Run mode: $RUN_MODE"
+SCAN_START=$(date +%s)
 
 case "$RUN_MODE" in
   docker) run_docker ;;
