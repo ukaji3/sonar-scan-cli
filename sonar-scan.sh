@@ -160,17 +160,6 @@ detect_platform() {
   esac
 }
 
-# --- Detect SonarQube start script path ---
-detect_sq_bin() {
-  local sq_dir="$1" os
-  os="$(uname -s)"
-  case "$os" in
-    Linux)  echo "$sq_dir/bin/linux-x86-64/sonar.sh" ;;
-    Darwin) echo "$sq_dir/bin/macosx-universal-64/sonar.sh" ;;
-    *)      error_json "unsupported OS for local mode: $os" ;;
-  esac
-}
-
 # --- Download and extract if not present ---
 ensure_local_install() {
   mkdir -p "$SONAR_HOME"
@@ -186,15 +175,10 @@ ensure_local_install() {
     # Remove bundled JREs (~280MB) - system Java is used instead
     rm -rf "$sq_dir/jres"
   fi
-  # Clean runtime data from previous runs
-  rm -rf "$sq_dir/data" "$sq_dir/temp" "$sq_dir/logs"
-  mkdir -p "$sq_dir/data" "$sq_dir/temp" "$sq_dir/logs"
 
   # sonar-scanner-cli (JRE-embedded, platform-specific)
-  local platform scanner_dir scanner_zip_name
+  local platform scanner_zip_name
   platform="$(detect_platform)"
-  scanner_dir="$SONAR_HOME/sonar-scanner-cli-${SCANNER_VERSION}-${platform}"
-  # The extracted directory name from the ZIP
   local scanner_extracted="$SONAR_HOME/sonar-scanner-${SCANNER_VERSION}-${platform}"
   if [[ ! -d "$scanner_extracted" ]]; then
     scanner_zip_name="sonar-scanner-cli-${SCANNER_VERSION}-${platform}.zip"
@@ -204,6 +188,14 @@ ensure_local_install() {
     unzip -qo "$SONAR_HOME/scanner.zip" -d "$SONAR_HOME" || error_json "failed to extract sonar-scanner-cli"
     rm -f "$SONAR_HOME/scanner.zip"
   fi
+}
+
+# Create an isolated instance work directory for parallel execution
+INSTANCE_DIR=""
+setup_instance_dir() {
+  INSTANCE_DIR="$SONAR_HOME/instances/$$"
+  rm -rf "$INSTANCE_DIR"
+  mkdir -p "$INSTANCE_DIR/data" "$INSTANCE_DIR/temp" "$INSTANCE_DIR/logs"
 }
 
 # ============================================================
@@ -269,41 +261,55 @@ SQ_PID=""
 
 cleanup_local() {
   log "==> Stopping local SonarQube..."
-  local sq_dir="$SONAR_HOME/sonarqube-${SQ_VERSION}"
-  local sq_bin
-  sq_bin="$(detect_sq_bin "$sq_dir")"
-
-  # Graceful stop via sonar.sh
-  "$sq_bin" stop >/dev/null 2>&1 || true
-  sleep 2
-
-  # Kill any remaining SonarQube/ES processes from this instance
+  # Kill processes belonging to this instance only (matched by instance dir path)
   local pids
-  pids=$(pgrep -f "sonarqube-${SQ_VERSION}" 2>/dev/null || true)
+  pids=$(pgrep -f "$INSTANCE_DIR" 2>/dev/null || true)
   if [[ -n "$pids" ]]; then
-    log "==> Force killing remaining processes..."
-    echo "$pids" | xargs kill -9 2>/dev/null || true
+    echo "$pids" | xargs kill 2>/dev/null || true
+    sleep 2
+    # Force kill if still alive
+    pids=$(pgrep -f "$INSTANCE_DIR" 2>/dev/null || true)
+    [[ -n "$pids" ]] && echo "$pids" | xargs kill -9 2>/dev/null || true
   fi
+  # Remove instance work directory
+  rm -rf "$INSTANCE_DIR"
 }
 
 run_local() {
   ensure_local_install
+  setup_instance_dir
   trap cleanup_local EXIT
 
   local sq_dir="$SONAR_HOME/sonarqube-${SQ_VERSION}"
-  local sq_bin
-  sq_bin="$(detect_sq_bin "$sq_dir")"
-  chmod +x "$sq_bin"
 
-  # Configure port
-  local sq_conf="$sq_dir/conf/sonar.properties"
-  if ! grep -q "^sonar.web.port=$SONAR_PORT" "$sq_conf" 2>/dev/null; then
-    sed -i.bak "s/^#\?sonar\.web\.port=.*/sonar.web.port=$SONAR_PORT/" "$sq_conf" 2>/dev/null || \
-      echo "sonar.web.port=$SONAR_PORT" >> "$sq_conf"
+  # Auto-assign port if default is busy or for parallel safety
+  if [[ "$SONAR_PORT" -eq 9000 ]]; then
+    SONAR_PORT=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+    log "==> Auto-assigned port: $SONAR_PORT"
   fi
 
-  log "==> [local] Starting SonarQube (port: $SONAR_PORT)..."
-  "$sq_bin" console >/dev/null 2>&1 &
+  # Allocate dynamic ports for ES and H2 to avoid conflicts
+  local es_port h2_port
+  es_port=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+  h2_port=$(python3 -c "import socket; s=socket.socket(); s.bind(('',0)); print(s.getsockname()[1]); s.close()")
+
+  log "==> [local] Starting SonarQube (port: $SONAR_PORT, instance: $$)..."
+  # Launch from SonarQube home; override runtime paths via system properties
+  (cd "$sq_dir" && exec java -Xms8m -Xmx32m \
+    --add-exports=java.base/jdk.internal.ref=ALL-UNNAMED \
+    --add-opens=java.base/java.lang=ALL-UNNAMED \
+    --add-opens=java.base/java.nio=ALL-UNNAMED \
+    --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
+    --add-opens=java.management/sun.management=ALL-UNNAMED \
+    --add-opens=jdk.management/com.sun.management.internal=ALL-UNNAMED \
+    -Dsonar.web.port="$SONAR_PORT" \
+    -Dsonar.path.data="$INSTANCE_DIR/data" \
+    -Dsonar.path.temp="$INSTANCE_DIR/temp" \
+    -Dsonar.path.logs="$INSTANCE_DIR/logs" \
+    -Dsonar.search.port="$es_port" \
+    -Dsonar.embeddedDatabase.port="$h2_port" \
+    -jar lib/sonar-application-${SQ_VERSION}.jar \
+  ) >/dev/null 2>&1 &
   SQ_PID=$!
 
   wait_for_sonarqube
@@ -311,7 +317,6 @@ run_local() {
   local token
   token="$(generate_token)"
 
-  # Find scanner binary
   local platform scanner_bin
   platform="$(detect_platform)"
   scanner_bin="$SONAR_HOME/sonar-scanner-${SCANNER_VERSION}-${platform}/bin/sonar-scanner"
@@ -323,6 +328,7 @@ run_local() {
     -Dsonar.host.url="http://localhost:$SONAR_PORT"
     -Dsonar.token="$token"
     -Dsonar.projectBaseDir="$SOURCE_DIR"
+    -Dsonar.working.directory="$INSTANCE_DIR/scannerwork"
   )
   if [[ -f "$SOURCE_DIR/sonar-project.properties" ]]; then
     log "==> Using sonar-project.properties"
